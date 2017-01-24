@@ -1,0 +1,953 @@
+diff --git a/README.org b/README.org
+index aaad3c5..944b407 100644
+--- a/README.org
++++ b/README.org
+@@ -285,6 +285,10 @@
+ 
+   - http://www.audioscience.com
+ 
++  Thanks to Exablaze for donating an ExaNIC X10
++
++  - http://exablaze.com/exanic-x10
++
+   Thanks to Intel Corporation for donating four NICs, the 82574,
+   82580, 82599, and the i210.
+ 
+diff --git a/clock.c b/clock.c
+index c716f01..629a160 100644
+--- a/clock.c
++++ b/clock.c
+@@ -96,6 +96,7 @@ struct clock {
+ 	int pollfd_valid;
+ 	int nports; /* does not include the UDS port */
+ 	int last_port_number;
++	int sde;
+ 	struct hash *index2port;
+ 	int free_running;
+ 	int freq_est_interval;
+@@ -105,6 +106,7 @@ struct clock {
+ 	int leap_set;
+ 	int kernel_leap;
+ 	int utc_offset;  /* grand master role */
++	int current_utc_offset;  /* UTC offset fallback */
+ 	int time_flags;  /* grand master role */
+ 	int time_source; /* grand master role */
+ 	enum servo_state servo_state;
+@@ -340,6 +342,11 @@ static void clock_link_status(void *ctx, int index, int linkup)
+ 		port_dispatch(p, EV_FAULT_CLEARED, 0);
+ 	} else {
+ 		port_dispatch(p, EV_FAULT_DETECTED, 0);
++		/*
++		 * A port going down can affect the BMCA result.
++		 * Force a state decision event.
++		 */
++		c->sde = 1;
+ 	}
+ }
+ 
+@@ -681,7 +688,7 @@ static void clock_update_slave(struct clock *c)
+ 	if (!(c->tds.flags & PTP_TIMESCALE)) {
+ 		pr_warning("foreign master not using PTP timescale");
+ 	}
+-	if (c->tds.currentUtcOffset < CURRENT_UTC_OFFSET) {
++	if (c->tds.currentUtcOffset < c->current_utc_offset) {
+ 		pr_warning("running in a temporal vortex");
+ 	}
+ }
+@@ -697,10 +704,10 @@ static int clock_utc_correct(struct clock *c, tmv_t ingress)
+ 
+ 	if (c->tds.flags & UTC_OFF_VALID && c->tds.flags & TIME_TRACEABLE) {
+ 		utc_offset = c->tds.currentUtcOffset;
+-	} else if (c->tds.currentUtcOffset > CURRENT_UTC_OFFSET) {
++	} else if (c->tds.currentUtcOffset > c->current_utc_offset) {
+ 		utc_offset = c->tds.currentUtcOffset;
+ 	} else {
+-		utc_offset = CURRENT_UTC_OFFSET;
++		utc_offset = c->current_utc_offset;
+ 	}
+ 
+ 	if (c->tds.flags & LEAP_61) {
+@@ -823,11 +830,13 @@ static int clock_add_port(struct clock *c, int phc_index,
+ 	}
+ 	index = sk_interface_index(fd, iface->name);
+ 	if (index < 0) {
++		close(fd);
+ 		return -1;
+ 	}
+ 	snprintf(key, sizeof(key), "%d", index);
+ 	if (hash_insert(c->index2port, key, p)) {
+ 		pr_err("failed to add port with index %d twice!", index);
++		close(fd);
+ 		return -1;
+ 	}
+ 	close(fd);
+@@ -1035,7 +1044,7 @@ struct clock *clock_create(enum clock_type type, struct config *config,
+ 	c->freq_est_interval = config_get_int(config, NULL, "freq_est_interval");
+ 	c->grand_master_capable = config_get_int(config, NULL, "gmCapable");
+ 	c->kernel_leap = config_get_int(config, NULL, "kernel_leap");
+-	c->utc_offset = CURRENT_UTC_OFFSET;
++	c->utc_offset = c->current_utc_offset = config_get_int(config, NULL, "utc_offset");
+ 	c->time_source = config_get_int(config, NULL, "timeSource");
+ 
+ 	if (c->free_running) {
+@@ -1462,7 +1471,7 @@ struct PortIdentity clock_parent_identity(struct clock *c)
+ 
+ int clock_poll(struct clock *c)
+ {
+-	int cnt, err, i, sde = 0;
++	int cnt, i;
+ 	enum fsm_event event;
+ 	struct pollfd *cur;
+ 	struct port *p;
+@@ -1489,14 +1498,14 @@ int clock_poll(struct clock *c)
+ 	cur++;
+ 	LIST_FOREACH(p, &c->ports, list) {
+ 		/* Let the ports handle their events. */
+-		for (i = err = 0; i < N_POLLFD && !err; i++) {
++		for (i = 0; i < N_POLLFD; i++) {
+ 			if (cur[i].revents & (POLLIN|POLLPRI)) {
+ 				event = port_event(p, i);
+ 				if (EV_STATE_DECISION_EVENT == event)
+-					sde = 1;
++					c->sde = 1;
+ 				if (EV_ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES == event)
+-					sde = 1;
+-				err = port_dispatch(p, event, 0);
++					c->sde = 1;
++				port_dispatch(p, event, 0);
+ 				/* Clear any fault after a little while. */
+ 				if (PS_FAULTY == port_state(p)) {
+ 					clock_fault_timeout(p, 1);
+@@ -1524,13 +1533,14 @@ int clock_poll(struct clock *c)
+ 		if (cur[i].revents & (POLLIN|POLLPRI)) {
+ 			event = port_event(c->uds_port, i);
+ 			if (EV_STATE_DECISION_EVENT == event)
+-				sde = 1;
++				c->sde = 1;
+ 		}
+ 	}
+ 
+-	if (sde)
++	if (c->sde) {
+ 		handle_state_decision_event(c);
+-
++		c->sde = 0;
++	}
+ 	clock_prune_subscriptions(c);
+ 	return 0;
+ }
+diff --git a/config.c b/config.c
+index 5da5ecc..e6fe676 100644
+--- a/config.c
++++ b/config.c
+@@ -199,6 +199,7 @@ struct config_item config_tab[] = {
+ 	PORT_ITEM_INT("logMinPdelayReqInterval", 0, INT8_MIN, INT8_MAX),
+ 	PORT_ITEM_INT("logSyncInterval", 0, INT8_MIN, INT8_MAX),
+ 	GLOB_ITEM_INT("logging_level", LOG_INFO, PRINT_LEVEL_MIN, PRINT_LEVEL_MAX),
++	GLOB_ITEM_STR("message_tag", NULL),
+ 	GLOB_ITEM_STR("manufacturerIdentity", "00:00:00"),
+ 	GLOB_ITEM_INT("max_frequency", 900000000, 0, INT_MAX),
+ 	PORT_ITEM_INT("min_neighbor_prop_delay", -20000000, INT_MIN, -1),
+@@ -237,6 +238,7 @@ struct config_item config_tab[] = {
+ 	GLOB_ITEM_STR("uds_address", "/var/run/ptp4l"),
+ 	GLOB_ITEM_INT("use_syslog", 1, 0, 1),
+ 	GLOB_ITEM_STR("userDescription", ""),
++	GLOB_ITEM_INT("utc_offset", CURRENT_UTC_OFFSET, 0, INT_MAX),
+ 	GLOB_ITEM_INT("verbose", 0, 0, 1),
+ };
+ 
+@@ -329,6 +331,7 @@ static enum parser_result parse_section_line(char *s, enum config_section *secti
+ }
+ 
+ static enum parser_result parse_item(struct config *cfg,
++				     int commandline,
+ 				     const char *section,
+ 				     const char *option,
+ 				     const char *value)
+@@ -387,7 +390,7 @@ static enum parser_result parse_item(struct config *cfg,
+ 				return NOT_PARSED;
+ 			}
+ 		}
+-	} else if (cgi->flags & CFG_ITEM_LOCKED) {
++	} else if (!commandline && cgi->flags & CFG_ITEM_LOCKED) {
+ 		/* This global option was set on the command line. */
+ 		return PARSED_OK;
+ 	} else {
+@@ -415,6 +418,10 @@ static enum parser_result parse_item(struct config *cfg,
+ 		dst->flags |= CFG_ITEM_DYNSTR;
+ 		break;
+ 	}
++
++	if (commandline) {
++		dst->flags |= CFG_ITEM_LOCKED;
++	}
+ 	return PARSED_OK;
+ }
+ 
+@@ -490,6 +497,25 @@ static void check_deprecated_options(const char **option)
+ 	}
+ }
+ 
++static struct option *config_alloc_longopts(struct config *cfg)
++{
++	struct config_item *ci;
++	struct option *opts;
++	int i;
++
++	opts = calloc(1, (1 + N_CONFIG_ITEMS) * sizeof(*opts));
++	if (!opts) {
++		return NULL;
++	}
++	for (i = 0; i < N_CONFIG_ITEMS; i++) {
++		ci = &config_tab[i];
++		opts[i].name = ci->label;
++		opts[i].has_arg = required_argument;
++	}
++
++	return opts;
++}
++
+ int config_read(char *name, struct config *cfg)
+ {
+ 	enum config_section current_section = UNKNOWN_SECTION;
+@@ -554,7 +580,7 @@ int config_read(char *name, struct config *cfg)
+ 
+ 		check_deprecated_options(&option);
+ 
+-		parser_res = parse_item(cfg, current_section == GLOBAL_SECTION ?
++		parser_res = parse_item(cfg, 0, current_section == GLOBAL_SECTION ?
+ 					NULL : current_port->name, option, value);
+ 
+ 		switch (parser_res) {
+@@ -627,8 +653,15 @@ struct config *config_create(void)
+ 	}
+ 	STAILQ_INIT(&cfg->interfaces);
+ 
++	cfg->opts = config_alloc_longopts(cfg);
++	if (!cfg->opts) {
++		free(cfg);
++		return NULL;
++	}
++
+ 	cfg->htab = hash_create();
+ 	if (!cfg->htab) {
++		free(cfg->opts);
+ 		free(cfg);
+ 		return NULL;
+ 	}
+@@ -657,6 +690,7 @@ struct config *config_create(void)
+ 	return cfg;
+ fail:
+ 	hash_destroy(cfg->htab, NULL);
++	free(cfg->opts);
+ 	free(cfg);
+ 	return NULL;
+ }
+@@ -670,6 +704,7 @@ void config_destroy(struct config *cfg)
+ 		free(iface);
+ 	}
+ 	hash_destroy(cfg->htab, config_item_free);
++	free(cfg->opts);
+ 	free(cfg);
+ }
+ 
+@@ -720,6 +755,33 @@ char *config_get_string(struct config *cfg, const char *section,
+ 	return ci->val.s;
+ }
+ 
++int config_parse_option(struct config *cfg, const char *opt, const char *val)
++{
++	enum parser_result result;
++
++	result = parse_item(cfg, 1, NULL, opt, val);
++
++	switch (result) {
++	case PARSED_OK:
++		return 0;
++	case NOT_PARSED:
++		fprintf(stderr, "unknown option %s\n", opt);
++		break;
++	case BAD_VALUE:
++		fprintf(stderr, "%s is a bad value for option %s\n", val, opt);
++		break;
++	case MALFORMED:
++		fprintf(stderr, "%s is a malformed value for option %s\n",
++			val, opt);
++		break;
++	case OUT_OF_RANGE:
++		fprintf(stderr, "%s is an out of range value for option %s\n",
++			val, opt);
++		break;
++	}
++	return -1;
++}
++
+ int config_set_double(struct config *cfg, const char *option, double val)
+ {
+ 	struct config_item *ci = config_find_item(cfg, NULL, option);
+diff --git a/config.h b/config.h
+index b02bde6..1cc7051 100644
+--- a/config.h
++++ b/config.h
+@@ -20,6 +20,7 @@
+ #ifndef HAVE_CONFIG_H
+ #define HAVE_CONFIG_H
+ 
++#include <getopt.h>
+ #include <sys/queue.h>
+ 
+ #include "ds.h"
+@@ -43,6 +44,9 @@ struct config {
+ 	STAILQ_HEAD(interfaces_head, interface) interfaces;
+ 	int n_interfaces;
+ 
++	/* for parsing command line options */
++	struct option *opts;
++
+ 	/* hash of all non-legacy items */
+ 	struct hash *htab;
+ };
+@@ -64,6 +68,13 @@ int config_get_int(struct config *cfg, const char *section,
+ char *config_get_string(struct config *cfg, const char *section,
+ 			const char *option);
+ 
++static inline struct option *config_long_options(struct config *cfg)
++{
++	return cfg->opts;
++}
++
++int config_parse_option(struct config *cfg, const char *opt, const char *val);
++
+ int config_set_double(struct config *cfg, const char *option, double val);
+ 
+ int config_set_section_int(struct config *cfg, const char *section,
+diff --git a/default.cfg b/default.cfg
+index 12542c0..ebb263a 100644
+--- a/default.cfg
++++ b/default.cfg
+@@ -7,6 +7,7 @@ slaveOnly		0
+ priority1		128
+ priority2		128
+ domainNumber		0
++#utc_offset		37
+ clockClass		248
+ clockAccuracy		0xFE
+ offsetScaledLogVariance	0xFFFF
+diff --git a/ds.h b/ds.h
+index b36862d..0e48d05 100644
+--- a/ds.h
++++ b/ds.h
+@@ -84,7 +84,7 @@ struct parent_ds {
+ 	unsigned int path_length;
+ };
+ 
+-#define CURRENT_UTC_OFFSET  36 /* 1 Jul 2015 */
++#define CURRENT_UTC_OFFSET  37 /* 1 Jan 2017 */
+ #define INTERNAL_OSCILLATOR 0xA0
+ 
+ struct timePropertiesDS {
+diff --git a/fsm.c b/fsm.c
+index d1423e7..ce6efad 100644
+--- a/fsm.c
++++ b/fsm.c
+@@ -27,7 +27,16 @@ enum port_state ptp_fsm(enum port_state state, enum fsm_event event, int mdiff)
+ 
+ 	switch (state) {
+ 	case PS_INITIALIZING:
+-		next = PS_LISTENING;
++		switch (event) {
++		case EV_FAULT_DETECTED:
++			next = PS_FAULTY;
++			break;
++		case EV_INIT_COMPLETE:
++			next = PS_LISTENING;
++			break;
++		default:
++			break;
++		}
+ 		break;
+ 
+ 	case PS_FAULTY:
+@@ -220,7 +229,16 @@ enum port_state ptp_slave_fsm(enum port_state state, enum fsm_event event,
+ 
+ 	switch (state) {
+ 	case PS_INITIALIZING:
+-		next = PS_LISTENING;
++		switch (event) {
++		case EV_FAULT_DETECTED:
++			next = PS_FAULTY;
++			break;
++		case EV_INIT_COMPLETE:
++			next = PS_LISTENING;
++			break;
++		default:
++			break;
++		}
+ 		break;
+ 
+ 	case PS_FAULTY:
+diff --git a/fsm.h b/fsm.h
+index 5d4ae91..0616daa 100644
+--- a/fsm.h
++++ b/fsm.h
+@@ -48,6 +48,7 @@ enum fsm_event {
+ 	EV_ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES,
+ 	EV_SYNCHRONIZATION_FAULT,
+ 	EV_MASTER_CLOCK_SELECTED,
++	EV_INIT_COMPLETE,
+ 	EV_RS_MASTER,
+ 	EV_RS_GRAND_MASTER,
+ 	EV_RS_SLAVE,
+diff --git a/gPTP.cfg b/gPTP.cfg
+index 75e996c..142996a 100644
+--- a/gPTP.cfg
++++ b/gPTP.cfg
+@@ -7,6 +7,7 @@ gmCapable		1
+ priority1		248
+ priority2		248
+ domainNumber		0
++#utc_offset		37
+ clockClass		248
+ clockAccuracy		0xFE
+ offsetScaledLogVariance	0xFFFF
+diff --git a/makefile b/makefile
+index 44be067..f898336 100644
+--- a/makefile
++++ b/makefile
+@@ -74,10 +74,9 @@ install: $(PRG)
+ 	install -p -m 644 -t $(DESTDIR)$(man8dir) $(PRG:%=%.8)
+ 
+ clean:
+-	rm -f $(OBJECTS) $(DEPEND)
++	rm -f $(OBJECTS) $(DEPEND) $(PRG)
+ 
+ distclean: clean
+-	rm -f $(PRG)
+ 	rm -f .version
+ 
+ # Implicit rule to generate a C source file's dependencies.
+diff --git a/phc2sys.8 b/phc2sys.8
+index 22d02c2..2559c74 100644
+--- a/phc2sys.8
++++ b/phc2sys.8
+@@ -206,6 +206,10 @@ The default is /var/run/ptp4l.
+ Set the maximum syslog level of messages which should be printed or sent to
+ the system logger. The default is 6 (LOG_INFO).
+ .TP
++.BI \-t " message-tag"
++Specify the tag which is added to all messages printed to the standard output
++or system log. The default is an empty string.
++.TP
+ .B \-m
+ Print messages to the standard output.
+ .TP
+diff --git a/phc2sys.c b/phc2sys.c
+index 35cf6fa..aa4186b 100644
+--- a/phc2sys.c
++++ b/phc2sys.c
+@@ -1209,6 +1209,7 @@ static void usage(char *progname)
+ 		" -x             apply leap seconds by servo instead of kernel\n"
+ 		" -z [path]      server address for UDS (/var/run/ptp4l)\n"
+ 		" -l [num]       set the logging level to 'num' (6)\n"
++		" -t [tag]       add tag to log messages\n"
+ 		" -m             print messages to stdout\n"
+ 		" -q             do not print messages to the syslog\n"
+ 		" -v             prints the software version and exits\n"
+@@ -1219,7 +1220,7 @@ static void usage(char *progname)
+ 
+ int main(int argc, char *argv[])
+ {
+-	char *progname;
++	char *progname, *message_tag = NULL;
+ 	char *src_name = NULL, *dst_name = NULL;
+ 	struct clock *src, *dst;
+ 	struct config *cfg;
+@@ -1251,7 +1252,7 @@ int main(int argc, char *argv[])
+ 	progname = strrchr(argv[0], '/');
+ 	progname = progname ? 1+progname : argv[0];
+ 	while (EOF != (c = getopt(argc, argv,
+-				  "arc:d:s:E:P:I:S:F:R:N:O:L:M:i:u:wn:xz:l:mqvh"))) {
++				  "arc:d:s:E:P:I:S:F:R:N:O:L:M:i:u:wn:xz:l:t:mqvh"))) {
+ 		switch (c) {
+ 		case 'a':
+ 			autocfg = 1;
+@@ -1363,6 +1364,9 @@ int main(int argc, char *argv[])
+ 					  PRINT_LEVEL_MIN, PRINT_LEVEL_MAX))
+ 				goto end;
+ 			break;
++		case 't':
++			message_tag = optarg;
++			break;
+ 		case 'm':
+ 			verbose = 1;
+ 			break;
+@@ -1405,6 +1409,7 @@ int main(int argc, char *argv[])
+ 	}
+ 
+ 	print_set_progname(progname);
++	print_set_tag(message_tag);
+ 	print_set_verbose(verbose);
+ 	print_set_syslog(use_syslog);
+ 	print_set_level(print_level);
+diff --git a/port.c b/port.c
+index a1ad6f6..0f99b1b 100644
+--- a/port.c
++++ b/port.c
+@@ -94,6 +94,8 @@ struct port {
+ 	unsigned int pdr_missing;
+ 	unsigned int multiple_seq_pdr_count;
+ 	unsigned int multiple_pdr_detected;
++	enum port_state (*state_machine)(enum port_state state,
++					 enum fsm_event event, int mdiff);
+ 	/* portDS */
+ 	struct PortIdentity portIdentity;
+ 	enum port_state     state; /*portState*/
+@@ -159,6 +161,19 @@ static void announce_to_dataset(struct ptp_message *m, struct port *p,
+ 	out->receiver     = p->portIdentity;
+ }
+ 
++static int clear_fault_asap(struct fault_interval *faint)
++{
++	switch (faint->type) {
++	case FTMO_LINEAR_SECONDS:
++		return faint->val == 0 ? 1 : 0;
++	case FTMO_LOG2_SECONDS:
++		return faint->val == FRI_ASAP ? 1 : 0;
++	case FTMO_CNT:
++		return 0;
++	}
++	return 0;
++}
++
+ static int msg_current(struct ptp_message *m, struct timespec now)
+ {
+ 	int64_t t1, t2, tmo;
+@@ -203,16 +218,11 @@ enum fault_type last_fault_type(struct port *port)
+ 	return port->last_fault_type;
+ }
+ 
+-int fault_interval(struct port *port, enum fault_type ft,
+-	struct fault_interval *i)
++void fault_interval(struct port *port, enum fault_type ft,
++		    struct fault_interval *i)
+ {
+-	if (!port || !i)
+-		return -EINVAL;
+-	if (ft < 0 || ft >= FT_CNT)
+-		return -EINVAL;
+ 	i->type = port->flt_interval_pertype[ft].type;
+ 	i->val = port->flt_interval_pertype[ft].val;
+-	return 0;
+ }
+ 
+ int port_fault_fd(struct port *port)
+@@ -2110,6 +2120,7 @@ static void port_p2p_transition(struct port *p, enum port_state next)
+ 		break;
+ 	case PS_LISTENING:
+ 		port_set_announce_tmo(p);
++		port_set_delay_tmo(p);
+ 		break;
+ 	case PS_PRE_MASTER:
+ 		port_set_qualification_tmo(p);
+@@ -2132,26 +2143,26 @@ static void port_p2p_transition(struct port *p, enum port_state next)
+ 	};
+ }
+ 
+-int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
++void port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ {
+ 	enum port_state next;
+-	struct fault_interval i;
+-	int fri_asap = 0;
+ 
+ 	if (clock_slave_only(p->clock)) {
+ 		if (event == EV_RS_MASTER || event == EV_RS_GRAND_MASTER) {
+ 			port_slave_priority_warning(p);
+ 		}
+-		next = ptp_slave_fsm(p->state, event, mdiff);
+-	} else {
+-		next = ptp_fsm(p->state, event, mdiff);
+ 	}
++	next = p->state_machine(p->state, event, mdiff);
+ 
+-	if (!fault_interval(p, last_fault_type(p), &i) &&
+-	    ((i.val == FRI_ASAP && i.type == FTMO_LOG2_SECONDS) ||
+-	     (i.val == 0 && i.type == FTMO_LINEAR_SECONDS)))
+-		fri_asap = 1;
+-	if (PS_INITIALIZING == next || (PS_FAULTY == next && fri_asap)) {
++	if (PS_FAULTY == next) {
++		struct fault_interval i;
++		fault_interval(p, last_fault_type(p), &i);
++		if (clear_fault_asap(&i)) {
++			pr_notice("port %hu: clearing fault immediately", portnum(p));
++			next = p->state_machine(next, EV_FAULT_CLEARED, 0);
++		}
++	}
++	if (PS_INITIALIZING == next) {
+ 		/*
+ 		 * This is a special case. Since we initialize the
+ 		 * port immediately, we can skip right to listening
+@@ -2160,18 +2171,16 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 		if (port_is_enabled(p)) {
+ 			port_disable(p);
+ 		}
+-		next = port_initialize(p) ? PS_FAULTY : PS_LISTENING;
+-		port_show_transition(p, next, event);
+-		p->state = next;
+-		if (next == PS_LISTENING && p->delayMechanism == DM_P2P) {
+-			port_set_delay_tmo(p);
++		if (port_initialize(p)) {
++			event = EV_FAULT_DETECTED;
++		} else {
++			event = EV_INIT_COMPLETE;
+ 		}
+-		port_notify_event(p, NOTIFY_PORT_STATE);
+-		return 1;
++		next = p->state_machine(next, event, 0);
+ 	}
+ 
+ 	if (next == p->state)
+-		return 0;
++		return;
+ 
+ 	port_show_transition(p, next, event);
+ 
+@@ -2187,12 +2196,11 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
+ 	if (p->jbod && next == PS_UNCALIBRATED) {
+ 		if (clock_switch_phc(p->clock, p->phc_index)) {
+ 			p->last_fault_type = FT_SWITCH_PHC;
+-			return port_dispatch(p, EV_FAULT_DETECTED, 0);
++			port_dispatch(p, EV_FAULT_DETECTED, 0);
++			return;
+ 		}
+ 		clock_sync_interval(p->clock, p->log_sync_interval);
+ 	}
+-
+-	return 0;
+ }
+ 
+ enum fsm_event port_event(struct port *p, int fd_index)
+@@ -2555,6 +2563,7 @@ struct port *port_open(int phc_index,
+ 
+ 	memset(p, 0, sizeof(*p));
+ 
++	p->state_machine = clock_slave_only(clock) ? ptp_slave_fsm : ptp_fsm;
+ 	p->phc_index = phc_index;
+ 	p->jbod = config_get_int(cfg, interface->name, "boundary_clock_jbod");
+ 	transport = config_get_int(cfg, interface->name, "network_transport");
+diff --git a/port.h b/port.h
+index 19dec4a..b00bc64 100644
+--- a/port.h
++++ b/port.h
+@@ -69,10 +69,8 @@ struct foreign_clock *port_compute_best(struct port *port);
+  * @param port A pointer previously obtained via port_open().
+  * @param event One of the @a fsm_event codes.
+  * @param mdiff Whether a new master has been selected.
+- * @return Zero if the port's file descriptor array is still valid,
+- *         and non-zero if it has become invalid.
+  */
+-int port_dispatch(struct port *p, enum fsm_event event, int mdiff);
++void port_dispatch(struct port *p, enum fsm_event event, int mdiff);
+ 
+ /**
+  * Generates state machine events based on activity on a port's file
+@@ -318,9 +316,8 @@ enum fault_type last_fault_type(struct port *port);
+  * @param port        A port instance.
+  * @param ft          Fault type.
+  * @param i           Pointer to the struct which will be filled in.
+- * @return Zero on success, non-zero otherwise.
+  */
+-int fault_interval(struct port *port, enum fault_type ft,
+-	struct fault_interval *i);
++void fault_interval(struct port *port, enum fault_type ft,
++		    struct fault_interval *i);
+ 
+ #endif
+diff --git a/print.c b/print.c
+index a82d0e7..6c48e1e 100644
+--- a/print.c
++++ b/print.c
+@@ -28,12 +28,18 @@ static int verbose = 0;
+ static int print_level = LOG_INFO;
+ static int use_syslog = 1;
+ static const char *progname;
++static const char *message_tag;
+ 
+ void print_set_progname(const char *name)
+ {
+ 	progname = name;
+ }
+ 
++void print_set_tag(const char *tag)
++{
++	message_tag = tag;
++}
++
+ void print_set_syslog(int value)
+ {
+ 	use_syslog = value ? 1 : 0;
+@@ -67,13 +73,17 @@ void print(int level, char const *format, ...)
+ 
+ 	if (verbose) {
+ 		f = level >= LOG_NOTICE ? stdout : stderr;
+-		fprintf(f, "%s[%ld.%03ld]: %s\n",
++		fprintf(f, "%s[%ld.%03ld]: %s%s%s\n",
+ 			progname ? progname : "",
+-			ts.tv_sec, ts.tv_nsec / 1000000, buf);
++			ts.tv_sec, ts.tv_nsec / 1000000,
++			message_tag ? message_tag : "", message_tag ? " " : "",
++			buf);
+ 		fflush(f);
+ 	}
+ 	if (use_syslog) {
+-		syslog(level, "[%ld.%03ld] %s",
+-		       ts.tv_sec, ts.tv_nsec / 1000000, buf);
++		syslog(level, "[%ld.%03ld] %s%s%s",
++		       ts.tv_sec, ts.tv_nsec / 1000000,
++		       message_tag ? message_tag : "", message_tag ? " " : "",
++		       buf);
+ 	}
+ }
+diff --git a/print.h b/print.h
+index e8f2c8e..1723d8a 100644
+--- a/print.h
++++ b/print.h
+@@ -33,6 +33,7 @@ __attribute__ ((format (printf, 2, 3)))
+ void print(int level, char const *format, ...);
+ 
+ void print_set_progname(const char *name);
++void print_set_tag(const char *tag);
+ void print_set_syslog(int value);
+ void print_set_level(int level);
+ void print_set_verbose(int value);
+diff --git a/ptp4l.8 b/ptp4l.8
+index 63e9abd..a724151 100644
+--- a/ptp4l.8
++++ b/ptp4l.8
+@@ -1,4 +1,4 @@
+-.TH PTP4l 8 "July 2016" "linuxptp"
++.TH PTP4l 8 "December 2016" "linuxptp"
+ .SH NAME
+ ptp4l - PTP Boundary/Ordinary Clock
+ 
+@@ -15,6 +15,8 @@ ptp4l - PTP Boundary/Ordinary Clock
+ ]
+ [
+ .BI \-i " interface"
++] [
++.I long-options
+ ]
+ .I .\|.\|.
+ 
+@@ -94,6 +96,19 @@ Prints the software version and exits.
+ .BI \-h
+ Display a help message.
+ 
++.SH LONG OPTIONS
++
++Each and every configuration file option (see below) may also appear
++as a "long" style command line argument.  For example, the slaveOnly
++option may be set using either of these two forms.
++
++.RS
++\f(CW\-\-slaveOnly 1   \-\-slaveOnly=1\fP
++.RE
++
++Option values given on the command line override values in the global
++section of the configuration file.
++
+ .SH CONFIGURATION FILE
+ 
+ The configuration file is divided into sections. Each section starts with a
+@@ -312,6 +327,10 @@ The default is 0xFFFF.
+ The domain attribute of the local clock.
+ The default is 0.
+ .TP
++.B utc_offset
++The current offset between TAI and UTC.
++The default is 37.
++.TP
+ .B free_running
+ Don't adjust the local clock if enabled.
+ The default is 0 (disabled).
+@@ -466,6 +485,12 @@ is 0.
+ The maximum logging level of messages which should be printed.
+ The default is 6 (LOG_INFO).
+ .TP
++.B message_tag
++The tag which is added to all messages printed to the standard output or system
++log.
++The default is an empty string (which cannot be set in the configuration file
++as the option requires an argument).
++.TP
+ .B verbose
+ Print messages to the standard output if enabled.
+ The default is 0 (disabled).
+diff --git a/ptp4l.c b/ptp4l.c
+index a87e7e6..f01ff6f 100644
+--- a/ptp4l.c
++++ b/ptp4l.c
+@@ -73,8 +73,9 @@ static void usage(char *progname)
+ int main(int argc, char *argv[])
+ {
+ 	char *config = NULL, *req_phc = NULL, *progname;
+-	int c, err = -1, print_level;
++	int c, err = -1, index, print_level;
+ 	struct clock *clock = NULL;
++	struct option *opts;
+ 	struct config *cfg;
+ 
+ 	if (handle_term_signals())
+@@ -84,12 +85,18 @@ int main(int argc, char *argv[])
+ 	if (!cfg) {
+ 		return -1;
+ 	}
++	opts = config_long_options(cfg);
+ 
+ 	/* Process the command line arguments. */
+ 	progname = strrchr(argv[0], '/');
+ 	progname = progname ? 1+progname : argv[0];
+-	while (EOF != (c = getopt(argc, argv, "AEP246HSLf:i:p:sl:mqvh"))) {
++	while (EOF != (c = getopt_long(argc, argv, "AEP246HSLf:i:p:sl:mqvh",
++				       opts, &index))) {
+ 		switch (c) {
++		case 0:
++			if (config_parse_option(cfg, opts[index].name, optarg))
++				goto out;
++			break;
+ 		case 'A':
+ 			if (config_set_int(cfg, "delay_mechanism", DM_AUTO))
+ 				goto out;
+@@ -176,6 +183,7 @@ int main(int argc, char *argv[])
+ 	}
+ 
+ 	print_set_progname(progname);
++	print_set_tag(config_get_string(cfg, NULL, "message_tag"));
+ 	print_set_verbose(config_get_int(cfg, NULL, "verbose"));
+ 	print_set_syslog(config_get_int(cfg, NULL, "use_syslog"));
+ 	print_set_level(config_get_int(cfg, NULL, "logging_level"));
+diff --git a/rtnl.c b/rtnl.c
+index 7f5dc45..251b5f3 100644
+--- a/rtnl.c
++++ b/rtnl.c
+@@ -160,6 +160,7 @@ int rtnl_open(void)
+ 	}
+ 	if (bind(fd, (struct sockaddr *) &sa, sizeof(sa))) {
+ 		pr_err("failed to bind netlink socket: %m");
++		close(fd);
+ 		return -1;
+ 	}
+ 	return fd;
+diff --git a/timemaster.c b/timemaster.c
+index 66ac521..cda2d90 100644
+--- a/timemaster.c
++++ b/timemaster.c
+@@ -599,7 +599,8 @@ static char **get_ptp4l_command(struct program_config *config,
+ }
+ 
+ static char **get_phc2sys_command(struct program_config *config, int domain,
+-				  int poll, int shm_segment, char *uds_path)
++				  int poll, int shm_segment, char *uds_path,
++				  char *message_tag)
+ {
+ 	char **command = (char **)parray_new();
+ 
+@@ -610,6 +611,7 @@ static char **get_phc2sys_command(struct program_config *config, int domain,
+ 		      xstrdup("-R"), string_newf("%.2f", poll > 0 ?
+ 						1.0 / (1 << poll) : 1 << -poll),
+ 		      xstrdup("-z"), xstrdup(uds_path),
++		      xstrdup("-t"), xstrdup(message_tag),
+ 		      xstrdup("-n"), string_newf("%d", domain),
+ 		      xstrdup("-E"), xstrdup("ntpshm"),
+ 		      xstrdup("-M"), string_newf("%d", shm_segment), NULL);
+@@ -671,14 +673,16 @@ static int add_ptp_source(struct ptp_domain *source,
+ 			  struct script *script)
+ {
+ 	struct config_file *config_file;
+-	char **command, *uds_path, **interfaces;
+-	int i, j, num_interfaces, *phc, *phcs, hw_ts;
++	char **command, *uds_path, **interfaces, *message_tag;
++	int i, j, num_interfaces, *phc, *phcs, hw_ts, sw_ts;
+ 	struct sk_ts_info ts_info;
+ 
+ 	pr_debug("adding PTP domain %d", source->domain);
+ 
+ 	hw_ts = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE |
+ 		SOF_TIMESTAMPING_RAW_HARDWARE;
++	sw_ts = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE |
++		SOF_TIMESTAMPING_SOFTWARE;
+ 
+ 	for (num_interfaces = 0;
+ 	     source->interfaces[num_interfaces]; num_interfaces++)
+@@ -700,9 +704,14 @@ static int add_ptp_source(struct ptp_domain *source,
+ 			return 1;
+ 		}
+ 
+-		if (!ts_info.valid ||
+-		    ((ts_info.so_timestamping & hw_ts) != hw_ts)) {
++		if (((ts_info.so_timestamping & hw_ts) != hw_ts)) {
+ 			pr_debug("interface %s: no PHC", source->interfaces[i]);
++			if ((ts_info.so_timestamping & sw_ts) != sw_ts) {
++				pr_err("time stamping not supported on %s",
++				       source->interfaces[i]);
++				free(phcs);
++				return 1;
++			}
+ 			continue;
+ 		}
+ 
+@@ -749,6 +758,12 @@ static int add_ptp_source(struct ptp_domain *source,
+ 		uds_path = string_newf("%s/ptp4l.%d.socket",
+ 				       config->rundir, *shm_segment);
+ 
++		message_tag = string_newf("[%d", source->domain);
++		for (j = 0; interfaces[j]; j++)
++			string_appendf(&message_tag, "%s%s", j ? "+" : ":",
++				       interfaces[j]);
++		string_appendf(&message_tag, "]");
++
+ 		config_file = xmalloc(sizeof(*config_file));
+ 		config_file->path = string_newf("%s/ptp4l.%d.conf",
+ 						config->rundir, *shm_segment);
+@@ -760,8 +775,9 @@ static int add_ptp_source(struct ptp_domain *source,
+ 		string_appendf(&config_file->content,
+ 			       "slaveOnly 1\n"
+ 			       "domainNumber %d\n"
+-			       "uds_address %s\n",
+-			       source->domain, uds_path);
++			       "uds_address %s\n"
++			       "message_tag %s\n",
++			       source->domain, uds_path, message_tag);
+ 
+ 		if (phcs[i] >= 0) {
+ 			/* HW time stamping */
+@@ -772,7 +788,8 @@ static int add_ptp_source(struct ptp_domain *source,
+ 			command = get_phc2sys_command(&config->phc2sys,
+ 						      source->domain,
+ 						      source->phc2sys_poll,
+-						      *shm_segment, uds_path);
++						      *shm_segment, uds_path,
++						      message_tag);
+ 			parray_append((void ***)&script->commands, command);
+ 		} else {
+ 			/* SW time stamping */
+@@ -793,6 +810,7 @@ static int add_ptp_source(struct ptp_domain *source,
+ 
+ 		(*shm_segment)++;
+ 
++		free(message_tag);
+ 		free(uds_path);
+ 		free(interfaces);
+ 	}
+diff --git a/util.c b/util.c
+index 594b49f..2b880ff 100644
+--- a/util.c
++++ b/util.c
+@@ -61,6 +61,7 @@ const char *ev_str[] = {
+ 	"ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES",
+ 	"SYNCHRONIZATION_FAULT",
+ 	"MASTER_CLOCK_SELECTED",
++	"INIT_COMPLETE",
+ 	"RS_MASTER",
+ 	"RS_GRAND_MASTER",
+ 	"RS_SLAVE",
