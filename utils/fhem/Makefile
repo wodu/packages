@@ -14,7 +14,7 @@ define Package/fhem
   TITLE:=Fhem is a GPL'd perl server for house automation.
   MAINTAINER:=Philipp Strobel
   URL:=http://fhem.de/fhem.html
-  DEPENDS:=+libgd +zlib +perl +perlbase-autoloader +perlbase-config +perlbase-dynaloader +perlbase-errno +perlbase-essential +perlbase-fcntl +perlbase-io +perlbase-math +perlbase-posix +perlbase-selectsaver +perlbase-socket +perlbase-symbol +perlbase-tie +perlbase-time +perlbase-xsloader +perlbase-file +perlbase-bytes +perlbase-compress +perlbase-list +perlbase-scalar +perlbase-utf8 +perl-device-serialport +kmod-usb-acm +perlbase-version +perlbase-filter +perlbase-text +perlbase-selfloader +perlbase-feature +libusb-compat +perl-weather +usbutils
+  DEPENDS:=+perl +perlbase-autoloader +perlbase-config +perlbase-dynaloader +perlbase-errno +perlbase-essential +perlbase-fcntl +perlbase-io +perlbase-math +perlbase-posix +perlbase-selectsaver +perlbase-socket +perlbase-symbol +perlbase-tie +perlbase-time +perlbase-xsloader +perlbase-file +perlbase-bytes +perlbase-compress +perlbase-list +perlbase-scalar +perlbase-utf8 +perl-device-serialport +kmod-usb-acm +perlbase-version +perlbase-filter +perlbase-text +perlbase-selfloader +perlbase-feature +libusb-compat +usbutils +perlbase-json-pp +perl-io-socket-ssl +perlbase-mime +perlbase-errno +perlbase-mime +perlbase-data +perlbase-digest
 endef
 
 define Package/fhem/Description 
@@ -44,6 +44,7 @@ define Package/fhem/install
 	$(CP) $(PKG_BUILD_DIR)/www $(1)$(BINDIR)
 	$(CP) $(PKG_BUILD_DIR)/docs $(1)$(BINDIR)
 	$(INSTALL_BIN) ./files/fhem.init $(1)/etc/init.d/fhem
+	$(CP) ./files/HMConfig_SenTHPL.pm $(1)$(BINDIR)/FHEM/
 endef
 
 $(eval $(call BuildPackage,fhem))
